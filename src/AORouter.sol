@@ -3,24 +3,18 @@ pragma solidity 0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IERC20, SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-interface IPool {
-    function swap(address _recipient, address _token) external payable;
-}
+contract AORouter is Ownable, Pausable {
+    using SafeERC20 for IERC20;
 
-contract AgentRouter is Ownable, Pausable {
     uint256 public agentFee = 10; // Default: 0.1% (in BPS)
-    address public poolContract; // Address of the Pool contract
 
     // Events
     event AgentFeeUpdated(uint256 newFee);
     event SwapCompleted(address indexed user, address indexed tokenToReceive, uint256 amountAfterFee);
-    event PoolContractUpdated(address indexed newPool);
 
-    constructor(address _poolContract) Ownable(msg.sender) {
-        require(_poolContract != address(0), "INVALID_POOL_ADDRESS");
-        poolContract = _poolContract;
-    }
+    constructor() Ownable(msg.sender) {}
 
     receive() external payable {}
 
@@ -32,41 +26,48 @@ contract AgentRouter is Ownable, Pausable {
         _unpause();
     }
 
-    function setPoolContract(address _newPool) external onlyOwner {
-        require(_newPool != address(0), "INVALID_POOL_ADDRESS");
-        poolContract = _newPool;
-        emit PoolContractUpdated(_newPool);
-    }
-
     function setAgentFee(uint256 _newFee) external onlyOwner {
-        require(_newFee > 10, "FEE_TOO_LOW"); // Must be greater than 0.1% (10 BPS)
         agentFee = _newFee;
         emit AgentFeeUpdated(_newFee);
     }
 
-    function swap(
+    function aoSwap(
+        address _swapRouter,
+        address _token,
         address[] memory _agentAddress,
-        address _tokenToReceive
+        bytes calldata _data,
+        uint256 _quotedTokenAmount
     ) external payable whenNotPaused {
         require(_agentAddress.length > 0, "NO_AGENTS_PROVIDED");
         require(msg.value > 0, "INVALID_NATIVE_AMOUNT");
-        require(_tokenToReceive != address(0), "INVALID_TOKEN_TO_RECEIVE");
+        require(_token != address(0), "INVALID_TOKEN_TO_RECEIVE");
 
         uint256 totalFee = (msg.value * agentFee) / 10_000; // BPS calculation
         uint256 feePerAgent = totalFee / _agentAddress.length; // Distribute evenly
         uint256 remainingAmount = msg.value - totalFee; // Amount sent to Pool contract
 
-        require(feePerAgent > 0, "FEE_TOO_SMALL");
-
         // Distribute fee
         for (uint256 i = 0; i < _agentAddress.length; i++) {
-            (bool success, ) = payable(_agentAddress[i]).call{value: feePerAgent}("");
-            require(success, "AGENT_TRANSFER_FAILED");
+            (bool successFee, ) = payable(_agentAddress[i]).call{value: feePerAgent}("");
+            require(successFee, "AGENT_TRANSFER_FAILED");
         }
 
-        // Send remaining ETH to the Pool
-        IPool(poolContract).swap{value: remainingAmount}(msg.sender, _tokenToReceive);
+        (bool success, ) = _swapRouter.call{value: remainingAmount, gas: 500000}(_data);
+        require(success, "SWAP_FAILED");
 
-        emit SwapCompleted(msg.sender, _tokenToReceive, remainingAmount);
+        IERC20(_token).transfer(msg.sender, _quotedTokenAmount);
+        
+        emit SwapCompleted(msg.sender, _token, remainingAmount);
+    }
+
+    function withdrawETH(address _receiver) external onlyOwner {
+        (bool success, ) = payable(_receiver).call{value: address(this).balance}("");
+        require(success, "WITHDRAW_FAILED");     
+    }
+
+    function withdrawERC20(address _token, address _receiver) external onlyOwner {
+        IERC20 token = IERC20(_token);
+        uint256 balance = token.balanceOf(address(this));
+        token.transfer(_receiver, balance);
     }
 }
